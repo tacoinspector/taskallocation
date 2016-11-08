@@ -9,6 +9,10 @@ FILENAME = "~/Documents/taskallocation.xlsx"
 def getPersonToSkill(fileName):
     return pd.read_excel(fileName, "PersonToSkill").fillna(0).astype('int')
 
+def getProjectImportance(fileName):
+    df = pd.read_excel(fileName, "ProjectImportance").set_index('Project')
+    return df / df.sum()
+
 def getDeadlines(fileName):
     return pd.read_excel(fileName, "Deadline").fillna(1e3).set_index('Project')
     
@@ -49,47 +53,48 @@ def getPersonTimeToCompleteMatrix(personToSkill, projectToSkill, tasks):
         ret[person] = dict(zip(tasks, getPersonToTimeVector(personToSkill.loc[person], taskTuple)))
     return ret
     
-def getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix):
-    return lpSum(taskAllocationMatrix[(task, person)] * personTimeMatrix[person][task] for person in people)
+def getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix, taskStartTimes):
+    return lpSum(taskAllocationMatrix[(task, person)] * personTimeMatrix[person][task] for person in people) + taskStartTimes[task]
     
 
 personToSkill = getPersonToSkill(FILENAME)
 projectToSkill = getProjectToSkillRequirements(FILENAME)
 deadlines = getDeadlines(FILENAME)
 immedPrec = getImmediatePrecedents(FILENAME)
+projectImportance = getProjectImportance(FILENAME)
 
 people = list(personToSkill.index)
 projects = list(projectToSkill.index)
 skills = list(projectToSkill.columns)
-taskTuple = list(it.product(projects, skills))
-tasks = ['{}_{}'.format(x, y) for x, y in taskTuple]
+
+tasks = []
+taskTuple = []
+for proj in projects:
+    for skill in skills:
+        if projectToSkill.loc[proj, skill] > 0:
+            tasks.append('{}_{}'.format(proj, skill))
+            taskTuple.append((proj, skill))
 taskToTuple = dict(zip(tasks, taskTuple))
-reqdTimePerTask = [projectToSkill.loc[x, y] for x, y in taskTuple]
-tasks = [t for t, rtt in zip(tasks, reqdTimePerTask) if rtt > 0]
-
-
 
 taskAllocationMatrix = LpVariable.dicts("TaskAllocationMatrix", [(i, j) for i in tasks for j in people],cat=LpBinary)
 overlapTimeSpent = LpVariable.dicts("OverlapIndicator", [(i, j) for i in tasks for j in tasks], cat=LpBinary)
-startTimePerTask = LpVariable.dicts('StartTimePerTask', tasks, 0, int(projectToSkill.sum(axis=1).sum()), cat=LpInteger)
+taskStartTimes = LpVariable.dicts('TaskStartTime', tasks, 0, int(projectToSkill.sum(axis=1).sum()), cat=LpInteger)
 maxTime = LpVariable("maxTime", lowBound =0, upBound = 10000, cat=LpInteger)
 timePerTask = LpVariable.dict('timePerTask',  tasks, lowBound = 0, upBound = 10000, cat = LpInteger)
-
 
 personAbilityMatrix = getPersonToSkillMatrix(personToSkill, tasks)
 personTimeMatrix = getPersonTimeToCompleteMatrix(personToSkill, projectToSkill, tasks)
 
 taskAllocation = pulp.LpProblem("Task allocation", LpMinimize)
 
-
 # Minimise the average time to complete tasks - can add weighting
-#taskAllocation += lpSum(timePerTask)
-taskAllocation += maxTime
+taskAllocation += lpSum(timePerTask[task] * projectImportance.loc[task.split('_')[0], 'Weight'] for task in tasks)
+#taskAllocation += maxTime
 
 for task in tasks:
     tt = taskToTuple[task]
     # Set the timePerTask to the start time + the time to complete
-    taskAllocation += timePerTask[task] == getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix) + startTimePerTask[task]
+    taskAllocation += timePerTask[task] == getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix, taskStartTimes)
     taskAllocation += maxTime >= timePerTask[task]
     # Only allow people to work on tasks they can work on    
     for person in people:
@@ -101,40 +106,38 @@ for task in tasks:
         taskAllocation += lpSum(taskAllocationMatrix[(task, person)] for person in people) == 1
         
     # Work deadlines
-    taskAllocation += getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix) + startTimePerTask[task] <= deadlines.loc[tt[0], 'Deadline']
+    taskAllocation += getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix, taskStartTimes) <= deadlines.loc[tt[0], 'Deadline']
 
 # Ensure no overlap
-if True:
-    for task_k in tasks:
-        for task_j in tasks:
-            if task_k != task_j: 
-                taskAllocation += startTimePerTask[task_k] - getTaskTimeExpr(task_j, people, personTimeMatrix, taskAllocationMatrix) - startTimePerTask[task_j] >= -100000 * overlapTimeSpent[(task_j, task_k)]
-                    
-                taskAllocation += -startTimePerTask[task_k] + \
-                    getTaskTimeExpr(task_j, people, personTimeMatrix, taskAllocationMatrix) + \
-                    startTimePerTask[task_j] >= 100000 * (overlapTimeSpent[(task_j, task_k)] - 1)
+for task_k in tasks:
+    for task_j in tasks:
+        if task_k != task_j: 
+            taskAllocation += taskStartTimes[task_k] - getTaskTimeExpr(task_j, people, personTimeMatrix, taskAllocationMatrix, taskStartTimes) \
+                    >= -100000 * overlapTimeSpent[(task_j, task_k)]
                 
-            for person in people:
-                if personAbilityMatrix[person][task_k] > 0 and personAbilityMatrix[person][task_j] > 0:
-                    taskAllocation += taskAllocationMatrix[(task_j, person)] + taskAllocationMatrix[(task_k, person)] \
-                        + overlapTimeSpent[(task_j, task_k)] + overlapTimeSpent[(task_k, task_j)] <= 3
-
-if True:
-    # Take care of dependencies
-    # j is prec, k is dep
-    for prec, dep in immedPrec['Dep'].iteritems():
-        precTt = taskToTuple[prec]
-        depTt = taskToTuple[dep]
-        for person_a in people:
-            if personToSkill.loc[person_a, precTt[1]] < 1: 
-                continue
-            for person_b in people:
-                if personToSkill.loc[person_b, depTt[1]] < 1:
-                    continue
+            taskAllocation += getTaskTimeExpr(task_j, people, personTimeMatrix, taskAllocationMatrix, taskStartTimes) \
+                - taskStartTimes[task_k] >= 100000 * (overlapTimeSpent[(task_j, task_k)] - 1)
             
-                taskAllocation += startTimePerTask[dep] >= startTimePerTask[prec]
-                taskAllocation += startTimePerTask[dep] >= startTimePerTask[prec] + \
-                    (personTimeMatrix[person_a][prec]) * (taskAllocationMatrix[(prec, person_a)] + taskAllocationMatrix[(dep, person_b)] - 1)
+        for person in people:
+            if personAbilityMatrix[person][task_k] > 0 and personAbilityMatrix[person][task_j] > 0:
+                taskAllocation += taskAllocationMatrix[(task_j, person)] + taskAllocationMatrix[(task_k, person)] \
+                    + overlapTimeSpent[(task_j, task_k)] + overlapTimeSpent[(task_k, task_j)] <= 3
+
+# Take care of dependencies
+# j is prec, k is dep
+for prec, dep in immedPrec['Dep'].iteritems():
+    precTt = taskToTuple[prec]
+    depTt = taskToTuple[dep]
+    for person_a in people:
+        if personToSkill.loc[person_a, precTt[1]] < 1: 
+            continue
+        for person_b in people:
+            if personToSkill.loc[person_b, depTt[1]] < 1:
+                continue
+        
+            taskAllocation += taskStartTimes[dep] >= taskStartTimes[prec]
+            taskAllocation += taskStartTimes[dep] >= taskStartTimes[prec] + \
+                (personTimeMatrix[person_a][prec]) * (taskAllocationMatrix[(prec, person_a)] + taskAllocationMatrix[(dep, person_b)] - 1)
 
 
 taskAllocation.solve()
@@ -145,7 +148,7 @@ if taskAllocation.status == 1:
             v = taskAllocationMatrix[(task, person)].varValue
             if np.abs(v - 1) < .005:
                 tt = taskToTuple[task]
-                timeToEnd =  v * projectToSkill.loc[tt[0], tt[1]] + startTimePerTask[task].varValue
+                timeToEnd =  v * projectToSkill.loc[tt[0], tt[1]] + taskStartTimes[task].varValue
                 timeToEnd = max(endTime, timeToEnd)
-                print '{} {} {} {}'.format(task, person, v * projectToSkill.loc[tt[0], tt[1]], startTimePerTask[task].varValue)
+                print '{} {} {} {}'.format(task, person, v * projectToSkill.loc[tt[0], tt[1]], taskStartTimes[task].varValue)
     print 'Time to finish: {}'.format(timeToEnd)
