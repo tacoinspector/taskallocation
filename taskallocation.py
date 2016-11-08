@@ -1,6 +1,7 @@
 import pandas as pd
 from pulp import *
 import itertools as it
+import numpy as np
 
 
 FILENAME = "~/Documents/taskallocation.xlsx"
@@ -100,7 +101,7 @@ for task in tasks:
         taskAllocation += lpSum(taskAllocationMatrix[(task, person)] for person in people) == 1
         
     # Work deadlines
-    #taskAllocation += getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix) + startTimePerTask[task] <= deadlines.loc[tt[0], 'Deadline']
+    taskAllocation += getTaskTimeExpr(task, people, personTimeMatrix, taskAllocationMatrix) + startTimePerTask[task] <= deadlines.loc[tt[0], 'Deadline']
 
 # Ensure no overlap
 if True:
